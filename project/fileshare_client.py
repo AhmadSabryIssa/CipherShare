@@ -1,125 +1,207 @@
-#!/usr/bin/env python3
-import socket, shlex, sys, os, pathlib, time
+import socket, shlex, sys, getpass, threading, queue, select, json, time
 from pathlib import Path
+from crypto_utils import encrypt_file, decrypt_file
 
-sys.path.insert(0, os.path.dirname(pathlib.Path(__file__).resolve()))
-CHUNK = 64 * 1024
+CHUNK        = 64 * 1024
 DOWNLOAD_DIR = Path("downloads"); DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 class FileShareClient:
     def __init__(self):
-        self.sock: socket.socket | None = None
+        self.sock      = None
+        self.username  = None
+        self._resp_q   = queue.Queue()
+        self._closed   = threading.Event()
+        self._busy     = threading.Lock()
 
-    # -------- low‑level --------
-    @staticmethod
-    def _readline(sock):
-        data = bytearray()
-        while (b := sock.recv(1)):
-            if b==b'\n': return data.decode().strip()
-            data.extend(b)
-        raise IOError("connection closed")
+    def _readline_raw(self):
+        buf = bytearray()
+        while True:
+            b = self.sock.recv(1)
+            if not b:
+                raise IOError("socket closed")
+            if b == b"\n":
+                return buf.decode().strip()
+            buf.extend(b)
 
-    # -------- session‑based ----
-    def connect_to_peer(self, host, port):
+    def _reader(self):
+        buf = bytearray()
+        while not self._closed.is_set():
+            if not self._busy.acquire(blocking=False):
+                time.sleep(0.02); continue
+            try:
+                r,_,_ = select.select([self.sock], [], [], 0.1)
+                if not r:
+                    continue
+                b = self.sock.recv(1)
+            except OSError:
+                break
+            finally:
+                self._busy.release()
+            if not b:
+                break
+            if b == b"\n":
+                line = buf.decode().strip(); buf.clear()
+                if line.startswith("NOTICE "):
+                    print(f"\n[NOTIFY] {line[7:]}")
+                    print("p2p> ", end="", flush=True)
+                else:
+                    self._resp_q.put(line)
+            else:
+                buf.extend(b)
+        self._closed.set()
+
+    def _resp(self):
+        if self._closed.is_set(): raise IOError("connection closed")
+        return self._resp_q.get()
+
+    def connect(self, host, port):
+        if self.sock:
+            self._closed.set(); self.sock.close()
         self.sock = socket.create_connection((host, port))
         print(f"[CLIENT] connected to {host}:{port}")
+        self._closed.clear()
+        threading.Thread(target=self._reader, daemon=True).start()
 
-    def register_user(self, u, pw):
-        self.sock.sendall(f"REGISTER {u} {pw}\n".encode()); print(self._readline(self.sock))
+    def register(self):
+        if not self.sock: return print("[CLIENT] connect first")
+        u = input("Username: "); p = getpass.getpass("Password: ")
+        self.sock.sendall(f"REGISTER {u} {p}\n".encode())
+        print("[CLIENT]", self._resp())
 
-    def login_user(self, u, pw):
-        self.sock.sendall(f"LOGIN {u} {pw}\n".encode()); print(self._readline(self.sock))
+    def login(self):
+        if not self.sock: return print("[CLIENT] connect first")
+        u = input("Username: "); self.sock.sendall(f"LOGIN {u}\n".encode())
+        if not self._resp().startswith("OK"):
+            return
+        p = getpass.getpass("Password: ")
+        self.sock.sendall(f"PASS {p}\n".encode())
+        print("[CLIENT]", self._resp())
+        self.username = u
 
-    def list_shared_files(self):
-        self.sock.sendall(b"LIST\n"); r=self._readline(self.sock); print("Files:", r[3:].strip() or "(none)")
+    def list(self):
+        if not self.sock: return print("[CLIENT] connect first")
+        self.sock.sendall(b"LIST\n")
+        print("[CLIENT] files:", self._resp()[3:] or "(none)")
 
-    def upload_file(self, path: Path):
-        if not path.is_file(): print("Not a file"); return
-        size=path.stat().st_size
-        self.sock.sendall(f"UPLOAD {path.name} {size}\n".encode())
-        with path.open("rb") as f:
-            while (chunk:=f.read(CHUNK)): self.sock.sendall(chunk)
-        print(self._readline(self.sock))
+    def upload(self, path: Path):
+        if not self.sock: return print("[CLIENT] connect first")
+        if not path.is_file(): return print("[CLIENT] not a file")
+        nonce, blob = encrypt_file(path.read_bytes())
+        payload = nonce + blob
+        with self._busy:
+            self.sock.sendall(f"UPLOAD {path.name} {len(payload)}\n".encode())
+            self.sock.sendall(payload)
+            reply = self._readline_raw()
+        print("[CLIENT]", reply)
 
-    def download_file(self, name):
-        self.sock.sendall(f"DOWNLOAD {name}\n".encode())
-        r=self._readline(self.sock)
-        if not r.startswith("OK"): print(r); return
-        size=int(r.split()[1]); dest=DOWNLOAD_DIR/name
-        with dest.open("wb") as f:
-            left=size
-            while left:
-                chunk=self.sock.recv(min(CHUNK,left)); f.write(chunk); left-=len(chunk)
-        print(f"Saved to {dest.resolve()} ({size} bytes)")
+    def download(self, name):
+        if not self.sock:
+            return print("[CLIENT] connect first")
+        if not self.username:
+            return print("[CLIENT] ERR login_required")
 
-    # -------- stateless helpers ----
-    def list_from_peer(self, host, port):
-        with socket.create_connection((host, port)) as s:
-            s.sendall(b"LISTFILES\n"); r=self._readline(s)
-            print(r[3:].strip() if r.startswith("OK") else r or "(none)")
-
-    def download_from_peer(self, host, port, name):
-        with socket.create_connection((host, port)) as s:
-            s.sendall(f"GET {name}\n".encode()); r=self._readline(s)
-            if not r.startswith("OK"): print(r); return
-            size=int(r.split()[1]); dest=DOWNLOAD_DIR/name; left=size
-            with dest.open("wb") as f:
-                while left:
-                    chunk=s.recv(min(CHUNK,left)); f.write(chunk); left-=len(chunk)
-            print(f"Saved to {dest.resolve()} ({size} bytes)")
-
-    def share_to_peer(self, host, port, path: Path):
-        if not path.is_file(): print("Not a file"); return
-        size=path.stat().st_size
-        with socket.create_connection((host, port)) as s:
-            s.sendall(f"UPLOAD {path.name} {size}\n".encode())
-            with path.open("rb") as f:
-                while (chunk:=f.read(CHUNK)): s.sendall(chunk)
-            print(self._readline(s))
-
-    # -------- live polling --------
-    def watch_peer(self, host, port, interval=5):
-        known=set()
-        print(f"Watching {host}:{port} every {interval}s – Ctrl‑C to stop")
-        try:
-            while True:
+        with self._busy:
+            self.sock.sendall(f"DOWNLOAD {name}\n".encode())
+            head = self._readline_raw()
+            if head.startswith("OK "):
+                size = int(head.split()[1])
+                data = bytearray()
+                while len(data) < size:
+                    data.extend(self.sock.recv(min(CHUNK, size - len(data))))
+            elif "no_file" in head:
                 try:
-                    with socket.create_connection((host, port), timeout=3) as s:
-                        s.sendall(b"LISTFILES\n")
-                        r=self._readline(s)
-                        if r.startswith("OK"):
-                            current=set(r[3:].strip().split()) if r[3:].strip() else set()
-                            for f in current-known: print(f"[NEW] {f}")
-                            known=current
-                except Exception: pass
-                time.sleep(interval)
-        except KeyboardInterrupt:
-            print("\nStopped watching.")
+                    with open("access_requests.json", "r") as f:
+                        access = json.load(f)
+                    rec = access.get("grant", {}).get(name, {}).get(self.username)
+                    if not rec:
+                        return print("[CLIENT] ERR not granted access")
+                    ip, port = rec["ip"], rec["port"]
+                    print(f"[CLIENT] Fetching from remote peer at {ip}:{port}")
+                    with socket.create_connection((ip, port), timeout=10) as s:
+                        s.sendall(f"DOWNLOAD {name}\n".encode())
 
-# -------- interactive shell --------
+                        header = b""
+                        while not header.endswith(b"\n"):
+                            chunk = s.recv(1)
+                            if not chunk:
+                                raise IOError("Connection closed during header read")
+                            header += chunk
+
+                        header = header.decode().strip()
+                        if not header.startswith("OK "):
+                            return print("[CLIENT]", header)
+
+                        size = int(header.split()[1])
+                        data = bytearray()
+                        while len(data) < size:
+                            chunk = s.recv(min(CHUNK, size - len(data)))
+                            if not chunk:
+                                break
+                            data.extend(chunk)
+                except Exception as e:
+                    return print(f"[CLIENT ERROR] failed remote fetch: {e}")
+            else:
+                return print("[CLIENT]", head)
+
+        # Try decrypting (AES-GCM), or fallback to plaintext
+        try:
+            nonce, blob = data[:12], data[12:]
+            plain = decrypt_file(nonce, blob)
+            (DOWNLOAD_DIR / name).write_bytes(plain)
+            print(f"[CLIENT] saved {name} (decrypted, {len(plain)} bytes)")
+        except Exception:
+            (DOWNLOAD_DIR / name).write_bytes(data)
+            print(f"[CLIENT] saved {name} (plaintext, {len(data)} bytes)")
+
+    def request(self, f, host, port, owner):
+        if not self.sock: return print("[CLIENT] connect first")
+        self.sock.sendall(f"REQUEST_REMOTE {f} {host} {port} {owner}\n".encode())
+        print("[CLIENT]", self._resp())
+
+    def grant(self, f, requester):
+        if not self.sock: return print("[CLIENT] connect first")
+        self.sock.sendall(f"GRANT {f} {requester}\n".encode())
+        print("[CLIENT]", self._resp())
+
+    def peerlist(self):
+        if not self.sock: return print("[CLIENT] connect first")
+        self.sock.sendall(b"PEERLIST\n")
+        print("[CLIENT] peer files:", self._resp()[3:] or "(none)")
+
+HELP = (
+    "commands:\n"
+    "  connect  <host> <port>\n"
+    "  register | login\n"
+    "  list | upload <file> | download <name>\n"
+    "  request  <file> <ownerHost> <ownerPort> <ownerUser>\n"
+    "  grant    <file> <requester>\n"
+    "  peerlist | quit"
+)
+
 def main():
-    cli=FileShareClient()
+    cli = FileShareClient()
     while True:
-        try: line=input("p2p> ")
-        except (EOFError,KeyboardInterrupt): print(); break
-        parts=shlex.split(line,posix=False);  # keep Windows paths intact
+        try:
+            parts = shlex.split(input("p2p> "), posix=False)
+        except (EOFError, KeyboardInterrupt):
+            print(); break
         if not parts: continue
-        cmd,*a=parts
-        if cmd=="quit": break
+        cmd, *a = parts
         try:
             match cmd:
-                case "connect":  cli.connect_to_peer(a[0],int(a[1]))
-                case "register": cli.register_user(*a)
-                case "login":    cli.login_user(*a)
-                case "list":     cli.list_shared_files()
-                case "upload"|"share": cli.upload_file(Path(a[0]))
-                case "download": cli.download_file(a[0])
-                case "peerlist": cli.list_from_peer(a[0],int(a[1]))
-                case "peerdl":   cli.download_from_peer(a[0],int(a[1]),a[2])
-                case "shareto":  cli.share_to_peer(a[0],int(a[1]),Path(a[2]))
-                case "watchpeer":cli.watch_peer(a[0],int(a[1]))
-                case _:          print("commands: connect, register, login, list, share, shareto, download, peerlist, peerdl, watchpeer, quit")
+                case "connect":   cli.connect(a[0], int(a[1]))
+                case "register":  cli.register()
+                case "login":     cli.login()
+                case "list":      cli.list()
+                case "upload":    cli.upload(Path(a[0]))
+                case "download":  cli.download(a[0])
+                case "request":   cli.request(a[0], a[1], int(a[2]), a[3])
+                case "grant":     cli.grant(a[0], a[1])
+                case "peerlist":  cli.peerlist()
+                case "quit":      break
+                case _:           print(HELP)
         except Exception as e:
-            print("error:", e)
+            print("[CLIENT ERROR]", e); print(HELP)
 
-if __name__=="__main__": main()
+if __name__ == "__main__":
+    main()
